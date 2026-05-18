@@ -98,7 +98,9 @@ Return ONLY this JSON (no markdown, no prose):
 
 
 async def score_jobs(jobs: list[Job], cv_text: str, max_jobs: int = 20) -> list[tuple[Job, MatchResult]]:
-    """Score sequentially with a 7s gap — keeps us under Gemini free tier (10 RPM)."""
+    """Score sequentially with a 7s gap — stays under Gemini free-tier 10 RPM.
+    Short-circuits if we hit the daily quota (429) so we don't burn calls.
+    """
     if not jobs:
         return []
     _configure()
@@ -106,9 +108,21 @@ async def score_jobs(jobs: list[Job], cv_text: str, max_jobs: int = 20) -> list[
     jobs = jobs[:max_jobs]
 
     out = []
+    quota_exhausted = False
+    consec_429 = 0
     for i, j in enumerate(jobs):
+        if quota_exhausted:
+            out.append((j, MatchResult(score=0, reason="skipped: Gemini quota exhausted", missing=[])))
+            continue
         res = await score_job(model, cv_text, j)
         out.append((j, res))
-        if i < len(jobs) - 1:
-            await asyncio.sleep(7)  # 10 RPM = one every 6s, we give 7s of margin
+        if "429" in res.reason:
+            consec_429 += 1
+            if consec_429 >= 3:
+                print("[matcher] hit 3 consecutive 429s — stopping to preserve quota")
+                quota_exhausted = True
+        else:
+            consec_429 = 0
+        if i < len(jobs) - 1 and not quota_exhausted:
+            await asyncio.sleep(7)
     return out
