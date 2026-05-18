@@ -97,19 +97,18 @@ Return ONLY this JSON (no markdown, no prose):
         return MatchResult(score=0, reason=f"err: {e}", missing=[])
 
 
-async def score_jobs(jobs: list[Job], cv_text: str, max_jobs: int = 60) -> list[tuple[Job, MatchResult]]:
+async def score_jobs(jobs: list[Job], cv_text: str, max_jobs: int = 20) -> list[tuple[Job, MatchResult]]:
+    """Score sequentially with a 7s gap — keeps us under Gemini free tier (10 RPM)."""
     if not jobs:
         return []
     _configure()
     model = genai.GenerativeModel(_MODEL_NAME)
     jobs = jobs[:max_jobs]
 
-    sem = asyncio.Semaphore(3)  # Gemini free tier: ~15 RPM
-
-    async def run(j):
-        async with sem:
-            res = await score_job(model, cv_text, j)
-            await asyncio.sleep(0.3)
-            return j, res
-
-    return await asyncio.gather(*[run(j) for j in jobs])
+    out = []
+    for i, j in enumerate(jobs):
+        res = await score_job(model, cv_text, j)
+        out.append((j, res))
+        if i < len(jobs) - 1:
+            await asyncio.sleep(7)  # 10 RPM = one every 6s, we give 7s of margin
+    return out
