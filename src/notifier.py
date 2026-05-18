@@ -90,26 +90,32 @@ async def _send_discord(text_or_payload) -> bool:
 
 
 async def _send_telegram(text: str) -> bool:
+    """Send to one OR many chat IDs. Comma-separated in TELEGRAM_CHAT_ID."""
     token = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    if not token or not chat_id:
+    raw_ids = os.getenv("TELEGRAM_CHAT_ID", "")
+    if not token or not raw_ids:
+        return False
+    chat_ids = [c.strip() for c in raw_ids.split(",") if c.strip()]
+    if not chat_ids:
         return False
     url = TG_API.format(token=token)
+    any_ok = False
     async with httpx.AsyncClient(timeout=30) as client:
-        try:
-            r = await client.post(url, json={
-                "chat_id": chat_id,
-                "text": text,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-            })
-            if r.status_code != 200:
-                print(f"[notifier] telegram {r.status_code}: {r.text[:200]}")
-                return False
-            return True
-        except Exception as e:
-            print(f"[notifier] telegram error: {type(e).__name__}: {e!r}")
-            return False
+        for chat_id in chat_ids:
+            try:
+                r = await client.post(url, json={
+                    "chat_id": chat_id,
+                    "text": text,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True,
+                })
+                if r.status_code != 200:
+                    print(f"[notifier] telegram {chat_id} {r.status_code}: {r.text[:200]}")
+                    continue
+                any_ok = True
+            except Exception as e:
+                print(f"[notifier] telegram {chat_id} error: {type(e).__name__}: {e!r}")
+    return any_ok
 
 
 async def send_job(job, match) -> bool:
