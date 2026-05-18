@@ -1,0 +1,32 @@
+name: Diagnose Telegram
+
+"on":
+  workflow_dispatch:
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: getMe (which bot does this token belong to?)
+        env:
+          T: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          echo "== getMe (bot identity) =="
+          curl -s "https://api.telegram.org/bot$T/getMe" | python3 -m json.tool
+
+      - name: getUpdates (which chats have messaged this bot?)
+        env:
+          T: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          echo "== getUpdates (recent chats that messaged the bot) =="
+          curl -s "https://api.telegram.org/bot$T/getUpdates" | python3 -m json.tool
+
+      - name: sendMessage attempt
+        env:
+          T: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          C: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          echo "== sendMessage to configured chat ID: $C =="
+          curl -s -X POST "https://api.telegram.org/bot$T/sendMessage" \
+            -d "chat_id=$C" \
+            -d "text=Diagnostic test from Job Hunter AI" | python3 -m json.tool
