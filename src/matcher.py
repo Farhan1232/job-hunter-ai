@@ -1,8 +1,11 @@
-"""CV-vs-job matching using Gemini (free tier).
+"""CV-vs-job matching with multi-provider fallback.
 
-Two-stage:
-  1. Cheap keyword pre-filter — only score jobs whose title/desc overlaps the CV.
-  2. Gemini scoring — percent + 1-line reason + missing skills.
+Order:
+  1. Gemini (free tier ~20 req/day on gemini-flash-latest)
+  2. Groq (free tier ~6000 req/day on Llama 3.3 70B) — kicks in when Gemini quota dies
+
+Same MatchResult shape from both. Keyword pre-filter runs first to avoid
+wasting API calls on obviously irrelevant jobs.
 """
 import os
 import json
@@ -10,6 +13,7 @@ import re
 import asyncio
 from dataclasses import dataclass
 
+import httpx
 import google.generativeai as genai
 
 from .sources.base import Job
@@ -17,19 +21,14 @@ from .sources.base import Job
 
 @dataclass
 class MatchResult:
-    score: int            # 0-100
+    score: int
     reason: str
     missing: list[str]
 
 
-_MODEL_NAME = "gemini-flash-latest"  # free tier, fast, always points to current flash
-
-
-def _configure():
-    key = os.getenv("GEMINI_API_KEY")
-    if not key:
-        raise RuntimeError("GEMINI_API_KEY not set")
-    genai.configure(api_key=key)
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+GROQ_MODEL   = os.getenv("GROQ_MODEL",   "llama-3.3-70b-versatile")
+GROQ_URL     = "https://api.groq.com/openai/v1/chat/completions"
 
 
 def _cv_keywords(cv_text: str) -> set[str]:
@@ -74,8 +73,8 @@ def _parse_response(text: str) -> MatchResult:
         return MatchResult(score=0, reason="parse error", missing=[])
 
 
-async def score_job(model, cv_text: str, job: Job) -> MatchResult:
-    prompt = f"""You are a recruiter. Compare CV to job. Return JSON only.
+def _build_prompt(cv_text: str, job: Job) -> str:
+    return f"""You are a recruiter. Compare CV to job. Return JSON only.
 
 CV:
 {cv_text[:4000]}
@@ -89,40 +88,105 @@ DESCRIPTION:
 Return ONLY this JSON (no markdown, no prose):
 {{"score": <0-100 int — how well CV matches>, "reason": "<one short sentence>", "missing": ["skill1","skill2"]}}
 """
-    try:
-        resp = await asyncio.to_thread(model.generate_content, prompt)
-        return _parse_response(resp.text or "")
-    except Exception as e:
-        print(f"[matcher] {job.id}: {e}")
-        return MatchResult(score=0, reason=f"err: {e}", missing=[])
 
+
+# ---------- Provider: Gemini ----------
+
+def _gemini_configured() -> bool:
+    key = os.getenv("GEMINI_API_KEY")
+    if not key:
+        return False
+    genai.configure(api_key=key)
+    return True
+
+
+async def _score_gemini(model, cv_text: str, job: Job) -> tuple[MatchResult, bool]:
+    """Returns (result, is_quota_error)."""
+    try:
+        resp = await asyncio.to_thread(model.generate_content, _build_prompt(cv_text, job))
+        return _parse_response(resp.text or ""), False
+    except Exception as e:
+        msg = str(e)
+        is_quota = "429" in msg or "quota" in msg.lower() or "rate" in msg.lower()
+        print(f"[gemini] {job.id}: {msg[:120]}")
+        return MatchResult(score=0, reason=f"err: gemini {msg[:80]}", missing=[]), is_quota
+
+
+# ---------- Provider: Groq ----------
+
+async def _score_groq(client: httpx.AsyncClient, cv_text: str, job: Job) -> tuple[MatchResult, bool]:
+    key = os.getenv("GROQ_API_KEY")
+    if not key:
+        return MatchResult(score=0, reason="err: no GROQ_API_KEY", missing=[]), False
+    try:
+        r = await client.post(
+            GROQ_URL,
+            headers={"Authorization": f"Bearer {key}"},
+            json={
+                "model": GROQ_MODEL,
+                "messages": [{"role": "user", "content": _build_prompt(cv_text, job)}],
+                "temperature": 0.2,
+                "response_format": {"type": "json_object"},
+            },
+            timeout=45,
+        )
+        if r.status_code == 429:
+            print(f"[groq] {job.id}: 429 rate-limited")
+            return MatchResult(score=0, reason="err: groq 429", missing=[]), True
+        if r.status_code >= 400:
+            print(f"[groq] {job.id}: {r.status_code} {r.text[:160]}")
+            return MatchResult(score=0, reason=f"err: groq {r.status_code}", missing=[]), False
+        data = r.json()
+        text = data["choices"][0]["message"]["content"]
+        return _parse_response(text), False
+    except Exception as e:
+        print(f"[groq] {job.id}: {type(e).__name__}: {e}")
+        return MatchResult(score=0, reason=f"err: groq {e}", missing=[]), False
+
+
+# ---------- Orchestrator ----------
 
 async def score_jobs(jobs: list[Job], cv_text: str, max_jobs: int = 20) -> list[tuple[Job, MatchResult]]:
-    """Score sequentially with a 7s gap — stays under Gemini free-tier 10 RPM.
-    Short-circuits if we hit the daily quota (429) so we don't burn calls.
-    """
+    """Score sequentially. Use Gemini first; on persistent 429 switch to Groq."""
     if not jobs:
         return []
-    _configure()
-    model = genai.GenerativeModel(_MODEL_NAME)
     jobs = jobs[:max_jobs]
 
-    out = []
-    quota_exhausted = False
-    consec_429 = 0
-    for i, j in enumerate(jobs):
-        if quota_exhausted:
-            out.append((j, MatchResult(score=0, reason="skipped: Gemini quota exhausted", missing=[])))
-            continue
-        res = await score_job(model, cv_text, j)
-        out.append((j, res))
-        if "429" in res.reason:
-            consec_429 += 1
-            if consec_429 >= 3:
-                print("[matcher] hit 3 consecutive 429s — stopping to preserve quota")
-                quota_exhausted = True
-        else:
-            consec_429 = 0
-        if i < len(jobs) - 1 and not quota_exhausted:
-            await asyncio.sleep(7)
+    gemini_ok = _gemini_configured()
+    groq_ok = bool(os.getenv("GROQ_API_KEY"))
+    if not gemini_ok and not groq_ok:
+        raise RuntimeError("Need at least one of GEMINI_API_KEY or GROQ_API_KEY")
+
+    gemini_model = genai.GenerativeModel(GEMINI_MODEL) if gemini_ok else None
+    gemini_dead = not gemini_ok
+    consec_gemini_429 = 0
+
+    out: list[tuple[Job, MatchResult]] = []
+    async with httpx.AsyncClient() as http:
+        for i, j in enumerate(jobs):
+            res: MatchResult
+            used = ""
+
+            if not gemini_dead and gemini_model is not None:
+                res, is_quota = await _score_gemini(gemini_model, cv_text, j)
+                used = "gemini"
+                if is_quota:
+                    consec_gemini_429 += 1
+                    if consec_gemini_429 >= 3:
+                        print("[matcher] Gemini exhausted — switching to Groq")
+                        gemini_dead = True
+                else:
+                    consec_gemini_429 = 0
+
+            if (gemini_dead or res.score == 0 and res.reason.startswith("err: gemini")) and groq_ok:
+                res, _ = await _score_groq(http, cv_text, j)
+                used = "groq"
+
+            if used and res.score > 0:
+                res.reason = f"[{used}] {res.reason}" if not res.reason.startswith("[") else res.reason
+            out.append((j, res))
+
+            if i < len(jobs) - 1:
+                # Gemini ~10 RPM (7s), Groq ~30 RPM (2s). Use the slower one to be safe.
+                await asyncio.sleep(2 if gemini_dead else 7)
     return out
