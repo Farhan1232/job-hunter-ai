@@ -1,6 +1,6 @@
 name: Job Hunter
 
-on:
+"on":
   schedule:
     # Every 60 minutes — adjust as needed (cron is in UTC)
     - cron: "0 * * * *"
