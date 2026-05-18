@@ -82,14 +82,30 @@ async def run():
     print(f"→ {len(above)} above {cfg.min_match_score}% threshold")
 
     to_send = above[: cfg.max_alerts_per_run]
+    sent_ids: set[str] = set()
     sent = 0
     for job, match in to_send:
         if await notifier.send_job(job, match):
             sent += 1
+            sent_ids.add(job.id)
         await asyncio.sleep(0.5)
 
-    storage.mark_seen(new_jobs)
-    print(f"→ sent {sent} alerts")
+    # Mark seen so we don't re-process next run:
+    #   - jobs filtered out by keyword pre-filter (irrelevant)
+    #   - jobs that got a real score below threshold
+    #   - jobs we successfully alerted on
+    # NOT mark seen (retry next run):
+    #   - jobs above threshold whose alert failed
+    #   - jobs that errored during scoring (e.g. Gemini quota)
+    pre_ids = {j.id for j in pre}
+    filtered_out = [j for j in new_jobs if j.id not in pre_ids]
+    scored_real = [j for (j, m) in scored
+                   if m.score < cfg.min_match_score
+                   and not m.reason.startswith(("err", "skipped", "parse"))]
+    alerted = [j for (j, _) in to_send if j.id in sent_ids]
+    to_mark = filtered_out + scored_real + alerted
+    storage.mark_seen(to_mark)
+    print(f"→ sent {sent} alerts; marked {len(to_mark)} seen ({len(new_jobs) - len(to_mark)} will retry)")
     await notifier.send_summary(len(all_jobs), len(new_jobs), sent)
 
 
