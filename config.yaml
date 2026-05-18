@@ -1,0 +1,51 @@
+# Edit this file to customize your job hunt.
+# Restart not needed — GitHub Actions reads it every run.
+
+# Job titles / keywords to search for
+keywords:
+  - cyber security
+  - cybersecurity
+  - information security
+  - SOC analyst
+  - security analyst
+  - penetration tester
+  - flutter developer
+  - mobile app developer
+  - web developer
+  - software engineer
+
+# Countries / regions to include
+# Adzuna country codes: gb, us, de, fr, in, ae, sg, etc.
+# Jooble accepts country names: Pakistan, United Arab Emirates, Qatar, Saudi Arabia, etc.
+adzuna_countries:
+  - us
+  - gb
+  - de
+  - ae
+  - in
+  - sg
+
+jooble_locations:
+  - Pakistan
+  - United Arab Emirates
+  - Qatar
+  - Saudi Arabia
+  - Oman
+  - Kuwait
+  - Bahrain
+  - Germany
+  - Netherlands
+  - United Kingdom
+  - United States
+
+# Remote-only sources are always fetched (Remotive, RemoteOK, Arbeitnow, Himalayas)
+
+# Match scoring
+# Jobs below this percentage will be ignored
+min_match_score: 50
+
+# How many top-matched jobs to alert per run (avoids Telegram flood)
+max_alerts_per_run: 15
+
+# Path to your CV (PDF)
+cv_path: data/cv.pdf
